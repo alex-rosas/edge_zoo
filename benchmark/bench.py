@@ -10,15 +10,15 @@ Output files:
   results/onnx_graph.csv   — quantized vs FP32 operator counts per model
 
 Device policy:
-  FP32 latency  → CUDA if available (CUDA events for accurate timing)
-  INT8 latency  → CPU  (torch static quantization is CPU-only)
-  Accuracy eval → CPU  (INT8 model cannot move to CUDA)
-  PTQ pipeline  → CPU  (quantization API is CPU-only)
+  FP32 latency      → CUDA if available (CUDA events for accurate timing)
+  INT8 latency      → CPU  (torch static quantization is CPU-only)
+  Accuracy eval     → CPU  (INT8 model cannot move to CUDA)
+  PTQ pipeline      → CPU  (quantization API is CPU-only)
   Error attribution → CPU
 
 Evaluation dataset:
-  evanarlian/imagenet_1k_resized_256 via HF streaming.
-  No token or licence required.
+  evanarlian/imagenet_1k_resized_256 via HF streaming, preloaded into memory
+  once before the benchmark loop. All three models evaluate on identical batches.
 
 Calibration dataset:
   CIFAR-10 — used only for observer calibration, not evaluation.
@@ -36,6 +36,7 @@ from quantize.pipeline import run_pipeline
 from quantize.observers import (
     real_calibration_loader,
     imagenet_eval_loader,
+    preload_eval_batches,
     evaluate_top1,
 )
 from quantize.error_analysis import run_error_attribution
@@ -105,7 +106,11 @@ def measure_onnx_size_mb(onnx_path: str) -> float:
 
 # ─── Per-model benchmark ──────────────────────────────────────────────────────
 
-def benchmark_model(entry, eval_loader) -> dict:
+def benchmark_model(entry, eval_batches: list) -> dict:
+    """
+    eval_batches: preloaded list of (images, labels) tuples.
+    Using a preloaded list guarantees FP32 and INT8 evaluate on identical data.
+    """
     name = entry.name
     print(f"\n{'═'*60}")
     print(f" Benchmarking: {name}")
@@ -145,15 +150,15 @@ def benchmark_model(entry, eval_loader) -> dict:
     int8_size_mb = measure_onnx_size_mb(onnx_path)
     size_ratio   = fp32_size_mb / int8_size_mb if int8_size_mb > 0 else float("nan")
 
-    # Accuracy — CPU only (INT8 model cannot move to CUDA)
+    # Accuracy — CPU only, using preloaded batches (same data for both models)
     print("  Evaluating FP32 accuracy (ImageNet val, cpu)...")
     fp32_top1 = evaluate_top1(
-        fp32_model, eval_loader, device="cpu", max_batches=N_EVAL_BATCHES
+        fp32_model, eval_batches, device="cpu", max_batches=N_EVAL_BATCHES
     )
 
     print("  Evaluating INT8 accuracy (ImageNet val, cpu)...")
     int8_top1 = evaluate_top1(
-        int8_model, eval_loader, device="cpu", max_batches=N_EVAL_BATCHES
+        int8_model, eval_batches, device="cpu", max_batches=N_EVAL_BATCHES
     )
 
     accuracy_delta = fp32_top1 - int8_top1
@@ -239,18 +244,17 @@ def main():
 
     zoo = get_zoo()
 
+    # Build and preload eval data once — all models use the same batches.
     print("\n  Building ImageNet evaluation loader...")
-    eval_loader = imagenet_eval_loader(
-        batch_size=32,
-        max_samples=2016,
-    )
+    eval_loader = imagenet_eval_loader(batch_size=32, max_samples=2016)
+    eval_batches = preload_eval_batches(eval_loader, max_batches=N_EVAL_BATCHES)
 
     tradeoff_rows = []
     error_dfs     = []
     onnx_paths    = {}
 
     for entry in zoo.values():
-        result = benchmark_model(entry, eval_loader)
+        result = benchmark_model(entry, eval_batches)
         tradeoff_rows.append(result["scalar"])
         error_dfs.append(result["error_df"])
         onnx_paths[entry.name] = result["scalar"]["onnx_path"]

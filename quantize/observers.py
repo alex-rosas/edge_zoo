@@ -7,13 +7,12 @@ Two calibration loaders (for the miscalibration experiment):
   - real_calibration_loader()     CIFAR-10 resized to 224x224, ImageNet stats
   - gaussian_calibration_loader() Random N(0,1) tensors, same shape
 
-Evaluation loader:
+Evaluation:
   - imagenet_eval_loader()        evanarlian/imagenet_1k_resized_256 via HF
                                   streaming. No licence or token required.
-                                  Images are pre-resized to 256px; we apply
-                                  CenterCrop(224) and ImageNet normalisation.
-                                  Produces top-1 numbers directly comparable
-                                  to published benchmarks.
+  - preload_eval_batches()        Materializes the streaming loader into a list
+                                  of (images, labels) tuples so all models in a
+                                  benchmark run evaluate on identical data.
 """
 
 import torch
@@ -35,31 +34,19 @@ def real_calibration_loader(
     image_size: int = 224,
     num_workers: int = 2,
 ) -> DataLoader:
-    """
-    CIFAR-10 resized to 224x224 with ImageNet normalisation.
-    Used for calibration only — not for accuracy evaluation.
-    """
+    """CIFAR-10 resized to 224x224 with ImageNet normalisation. Calibration only."""
     transform = T.Compose([
         T.Resize((image_size, image_size)),
         T.ToTensor(),
         T.Normalize(mean=IMAGENET_MEAN, std=IMAGENET_STD),
     ])
-
     dataset = datasets.CIFAR10(
-        root=data_dir,
-        train=False,
-        download=True,
-        transform=transform,
+        root=data_dir, train=False, download=True, transform=transform,
     )
-
     loader = DataLoader(
-        dataset,
-        batch_size=batch_size,
-        shuffle=True,
-        num_workers=num_workers,
-        pin_memory=False,
+        dataset, batch_size=batch_size, shuffle=True,
+        num_workers=num_workers, pin_memory=False,
     )
-
     print(
         f"  Real calibration loader: CIFAR-10 ({len(dataset)} images, "
         f"batch_size={batch_size}, image_size={image_size})"
@@ -73,9 +60,7 @@ class _HFImageNetDataset(IterableDataset):
     """
     Wraps evanarlian/imagenet_1k_resized_256 validation split as a PyTorch
     IterableDataset using HF streaming. No licence or token required.
-
-    Images are already resized to 256px shortest side. We apply CenterCrop(224)
-    and ImageNet normalisation — the standard torchvision evaluation pipeline.
+    Images are pre-resized to 256px; we apply CenterCrop(224) and normalisation.
     """
 
     def __init__(self, max_samples: int = 2000):
@@ -91,7 +76,7 @@ class _HFImageNetDataset(IterableDataset):
         ds = load_dataset(
             "evanarlian/imagenet_1k_resized_256",
             split="val",
-            streaming=True
+            streaming=True,
         )
         count = 0
         for sample in ds:
@@ -100,8 +85,7 @@ class _HFImageNetDataset(IterableDataset):
             img = sample["image"]
             if img.mode != "RGB":
                 img = img.convert("RGB")
-            label = sample["label"]
-            yield self.transform(img), label
+            yield self.transform(img), sample["label"]
             count += 1
 
 
@@ -111,28 +95,47 @@ def imagenet_eval_loader(
 ) -> DataLoader:
     """
     ImageNet-1k validation set via HF streaming.
-    No token or licence required — evanarlian/imagenet_1k_resized_256 is public.
-
-    Args:
-        batch_size:  Images per batch. Default: 32.
-        max_samples: Validation images to use. Default: 2000.
-
-    Returns:
-        DataLoader yielding (images, labels) with ImageNet normalisation.
+    No token or licence required.
     """
     dataset = _HFImageNetDataset(max_samples=max_samples)
-
-    loader = DataLoader(
-        dataset,
-        batch_size=batch_size,
-        num_workers=0,   # IterableDataset + streaming — no multiprocessing
-    )
-
+    loader  = DataLoader(dataset, batch_size=batch_size, num_workers=0)
     print(
         f"  ImageNet eval loader: HF streaming evanarlian/imagenet_1k_resized_256 "
         f"(max {max_samples} images, batch_size={batch_size})"
     )
     return loader
+
+
+def preload_eval_batches(loader: DataLoader, max_batches: int = 63) -> list:
+    """
+    Materialise a streaming DataLoader into a list of (images, labels) tuples.
+
+    Why this is necessary:
+      HF streaming loaders are single-pass iterators. Once exhausted they
+      restart from the beginning on the next iteration — but restarting
+      re-initialises the stream and may return a different ordering or subset
+      depending on network state. When FP32 and INT8 models evaluate on
+      different batches, the accuracy delta is meaningless.
+
+      Preloading once into memory guarantees all models evaluate on exactly
+      the same images in the same order.
+
+    Args:
+        loader:      DataLoader wrapping an IterableDataset.
+        max_batches: Number of batches to collect.
+
+    Returns:
+        List of (images_tensor, labels_tensor) tuples.
+    """
+    print(f"  Preloading {max_batches} eval batches into memory...")
+    batches = []
+    for i, (images, labels) in enumerate(loader):
+        if i >= max_batches:
+            break
+        batches.append((images, labels))
+    n_images = sum(b[0].shape[0] for b in batches)
+    print(f"  Loaded {len(batches)} batches ({n_images} images)")
+    return batches
 
 
 # ─── Gaussian calibration loader ─────────────────────────────────────────────
@@ -158,14 +161,8 @@ def gaussian_calibration_loader(
     """Random N(0,1) tensors — the miscalibration condition."""
     n_samples = n_batches * batch_size
     dataset   = _GaussianDataset(n_samples=n_samples, image_size=image_size)
-
-    loader = DataLoader(
-        dataset,
-        batch_size=batch_size,
-        shuffle=False,
-        num_workers=num_workers,
-    )
-
+    loader    = DataLoader(dataset, batch_size=batch_size, shuffle=False,
+                           num_workers=num_workers)
     print(
         f"  Gaussian calibration loader: N(0,1) ({n_samples} tensors, "
         f"batch_size={batch_size}, image_size={image_size})"
@@ -186,10 +183,7 @@ def get_observer_ranges(prepared_model: nn.Module) -> dict:
             continue
         if min_val.numel() == 0 or torch.isinf(min_val).all():
             continue
-        ranges[name] = {
-            "min": float(min_val.min()),
-            "max": float(max_val.max()),
-        }
+        ranges[name] = {"min": float(min_val.min()), "max": float(max_val.max())}
     return ranges
 
 
@@ -212,18 +206,22 @@ def print_observer_ranges(prepared_model: nn.Module) -> None:
 
 def evaluate_top1(
     model: nn.Module,
-    data_loader,
+    data_loader,           # DataLoader or list of (images, labels) tuples
     device: str = "cpu",
     max_batches: int = 50,
 ) -> float:
     """
-    Compute top-1 accuracy on a DataLoader subset.
+    Compute top-1 accuracy on a DataLoader or preloaded batch list.
+
+    Accepts either a DataLoader or the list returned by preload_eval_batches().
+    Iterating a list is deterministic and repeatable — the correct choice when
+    comparing FP32 and INT8 accuracy on the same data.
 
     Args:
         model:       Any nn.Module (FP32 or INT8).
-        data_loader: DataLoader yielding (images, labels).
+        data_loader: DataLoader or list of (images, labels) tuples.
         device:      Compute device.
-        max_batches: Batches to evaluate.
+        max_batches: Maximum batches to evaluate.
 
     Returns:
         Top-1 accuracy as a float in [0, 1].
