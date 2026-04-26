@@ -4,5 +4,6 @@ __pycache__/
 .DS_Store
 *.egg-info/
 genesis/
-.vscode/onnx_models/
+.vscode/
 results/
+onnx_models
