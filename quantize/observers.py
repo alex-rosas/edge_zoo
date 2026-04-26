@@ -91,8 +91,7 @@ class _HFImageNetDataset(IterableDataset):
         ds = load_dataset(
             "evanarlian/imagenet_1k_resized_256",
             split="val",
-            streaming=True,
-            trust_remote_code=True,
+            streaming=True
         )
         count = 0
         for sample in ds:
