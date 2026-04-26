@@ -237,6 +237,11 @@ def export_onnx(
       stage (onnx_interrogate.py) detects exactly this — counting quantized
       versus FP32 operator nodes is a diagnostic step, not a verification step.
 
+    Why dynamo=False:
+      The new dynamo-based ONNX exporter (default in PyTorch 2.x) does not
+      support quantized models with packed conv parameters
+      (Conv2dPackedParamsBase). The legacy exporter handles these correctly.
+
     Args:
         model:          Quantized model from convert_to_int8().
         input_shape:    Tensor shape excluding batch dim, e.g. (3, 224, 224).
@@ -256,6 +261,7 @@ def export_onnx(
             (dummy_input,),
             output_path,
             opset_version=opset_version,
+            dynamo=False,          # legacy exporter — required for quantized models
             input_names=["input"],
             output_names=["output"],
             dynamic_axes={
@@ -311,11 +317,9 @@ def run_pipeline(
     print(f"\n── Pipeline: {name} ──")
 
     # Preserve the original FP32 model for layer-wise error attribution.
-    # The pipeline will mutate its own copy; the zoo entry must stay intact.
     fp32_model = copy.deepcopy(entry.model)
     fp32_model.eval()
 
-    # One example input for FX graph tracing — shape matters, values do not.
     example_input = torch.zeros(1, *entry.input_shape)
 
     print("  Stage 1: BN-folding prep (deep-copy + eval)")
