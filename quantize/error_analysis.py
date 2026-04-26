@@ -36,7 +36,7 @@ def collect_layer_outputs(
 
     Uses PyTorch forward hooks — registered callbacks that intercept module
     outputs without modifying the model or its computation. Each hook stores
-    a detached CPU copy of the output tensor, keyed by module name.
+    a detached CPU float copy of the output tensor, keyed by module name.
 
     Why detached CPU copies:
       - detach(): we are not computing gradients; keeping the computation
@@ -45,6 +45,14 @@ def collect_layer_outputs(
         avoids holding GPU memory after the pass completes.
       - clone(): without clone(), the stored tensor is a view of a buffer
         that may be overwritten by a subsequent operation.
+
+    Why dequantize() before storing:
+      INT8 model outputs are quantized tensors (dtype quint8/qint8).
+      Calling .float() directly on a quantized tensor raises a RuntimeError.
+      .dequantize() converts the quantized tensor to float32 using its stored
+      scale and zero-point — the correct operation for comparing against FP32
+      activations. For non-quantized tensors, .dequantize() is not available,
+      so we fall back to .float().
 
     Why named_modules() and not named_children():
       named_children() returns only top-level submodules. named_modules()
@@ -58,22 +66,26 @@ def collect_layer_outputs(
         device:       Compute device. Default: "cpu".
 
     Returns:
-        Dict mapping module_name → output Tensor (detached, on CPU).
+        Dict mapping module_name → output Tensor (detached, float32, on CPU).
     """
     outputs: Dict[str, torch.Tensor] = {}
     hooks   = []
 
     def _make_hook(name: str):
-        def _hook(module, input, output): # type: ignore[reportUnusedParameter], module and input required by PyTorch hook API
-            # Guard: some modules output tuples (e.g. LSTM). Take first element.
+        def _hook(module, input, output):  # noqa: module and input required by PyTorch hook API
             if isinstance(output, torch.Tensor):
-                outputs[name] = output.detach().cpu().clone()
+                t = output.detach().cpu()
+                # Quantized tensors must be dequantized before arithmetic.
+                if t.is_quantized:
+                    t = t.dequantize()
+                else:
+                    t = t.float()
+                outputs[name] = t.clone()
         return _hook
 
-    # Register one hook per named module.
     for name, module in model.named_modules():
         if name == "":
-            continue   # skip the root module itself
+            continue
         hooks.append(module.register_forward_hook(_make_hook(name)))
 
     model.eval()
@@ -82,8 +94,6 @@ def collect_layer_outputs(
     with torch.no_grad():
         model(input_tensor.to(device))
 
-    # Remove all hooks immediately — leaving them registered would slow down
-    # every subsequent forward pass on this model.
     for h in hooks:
         h.remove()
 
@@ -134,7 +144,6 @@ def compute_layer_errors(
     print("  Collecting INT8 layer outputs...")
     int8_outputs = collect_layer_outputs(int8_model, input_tensor, device)
 
-    # Only compare layers present in both models.
     common_layers = set(fp32_outputs.keys()) & set(int8_outputs.keys())
     print(f"  Common layers: {len(common_layers)} "
           f"(FP32: {len(fp32_outputs)}, INT8: {len(int8_outputs)})")
@@ -142,11 +151,9 @@ def compute_layer_errors(
     records: List[dict] = []
 
     for name in sorted(common_layers):
-        y_fp32 = fp32_outputs[name].float()
-        y_int8 = int8_outputs[name].float()
+        y_fp32 = fp32_outputs[name]
+        y_int8 = int8_outputs[name]
 
-        # Shape mismatch can occur if quantization changes a layer's output
-        # layout. Skip rather than error — note it for investigation.
         if y_fp32.shape != y_int8.shape:
             print(f"  Shape mismatch at {name}: "
                   f"fp32={y_fp32.shape} int8={y_int8.shape} — skipped")
@@ -194,10 +201,10 @@ def print_error_table(df: pd.DataFrame, top_n: int = 10) -> None:
 
     for rank, (_, row) in enumerate(df.head(top_n).iterrows(), start=1):
         print(
-         f"  {rank:<5} "
-         f"{row['l2_error']:>10.4f} "
-         f"{row['max_error']:>10.4f}  "
-         f"{row['layer']}"
+            f"  {rank:<5} "
+            f"{row['l2_error']:>10.4f} "
+            f"{row['max_error']:>10.4f}  "
+            f"{row['layer']}"
         )
 
     print(f"\n  Total layers compared: {len(df)}")
@@ -232,10 +239,9 @@ def run_error_attribution(
     """
     print(f"\n── Error attribution: {entry.name} ──")
 
-    # Use a fixed-seed random input so results are reproducible across runs.
-    # The input distribution does not affect the attribution: we are measuring
-    # the difference between two deterministic functions (FP32 and INT8)
-    # on the same input, not characterising the input distribution.
+    # Fixed-seed random input for reproducibility. The input distribution
+    # does not affect the ranking — we are measuring the difference between
+    # two deterministic functions on the same input.
     torch.manual_seed(42)
     input_tensor = torch.randn(1, *entry.input_shape)
 
