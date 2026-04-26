@@ -77,7 +77,7 @@ class _HFImageNetDataset(IterableDataset):
             "evanarlian/imagenet_1k_resized_256",
             split="val",
             streaming=True,
-        )
+        ).shuffle(buffer_size=5000, seed=42)
         # Dataset is sorted by class (50 images per class × 1000 classes = 50000).
         # Sample every 25th image to get ~2 images per class across all 1000 classes.
         count = 0
