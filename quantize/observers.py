@@ -78,10 +78,14 @@ class _HFImageNetDataset(IterableDataset):
             split="val",
             streaming=True,
         )
+        # Dataset is sorted by class (50 images per class × 1000 classes = 50000).
+        # Sample every 25th image to get ~2 images per class across all 1000 classes.
         count = 0
-        for sample in ds:
+        for i, sample in enumerate(ds):
             if count >= self.max_samples:
                 break
+            if i % 25 != 0:
+                continue
             img = sample["image"]
             if img.mode != "RGB":
                 img = img.convert("RGB")
