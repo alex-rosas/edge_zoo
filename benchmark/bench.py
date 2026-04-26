@@ -9,17 +9,19 @@ Output files:
   results/layer_errors.csv — layer-wise L2 and max error per model
   results/onnx_graph.csv   — quantized vs FP32 operator counts per model
 
-Device:
-  Uses CUDA if available, falls back to CPU.
-  Latency measured with CUDA events on GPU for accuracy.
+Device policy:
+  FP32 latency  → CUDA if available (CUDA events for accurate timing)
+  INT8 latency  → CPU  (torch static quantization is CPU-only)
+  Accuracy eval → CPU  (INT8 model cannot move to CUDA)
+  PTQ pipeline  → CPU  (quantization API is CPU-only)
+  Error attribution → CPU
 
 Evaluation dataset:
   evanarlian/imagenet_1k_resized_256 via HF streaming.
-  No token or licence required. Produces top-1 numbers directly
-  comparable to published benchmarks.
+  No token or licence required.
 
 Calibration dataset:
-  CIFAR-10 (unchanged) — used only for observer calibration, not evaluation.
+  CIFAR-10 — used only for observer calibration, not evaluation.
 """
 
 import time
@@ -48,7 +50,10 @@ RESULTS_DIR    = "results"
 N_LATENCY_RUNS = 50
 N_CAL_BATCHES  = 100
 N_EVAL_BATCHES = 63       # 63 × 32 = 2016 ImageNet val images
-DEVICE         = "cuda" if torch.cuda.is_available() else "cpu"
+
+# CUDA used only for FP32 latency measurement.
+# Everything else runs on CPU — quantized models are CPU-only.
+CUDA_AVAILABLE = torch.cuda.is_available()
 
 
 # ─── Latency measurement ──────────────────────────────────────────────────────
@@ -57,7 +62,7 @@ def measure_latency(
     model: nn.Module,
     input_shape: tuple,
     n_runs: int = N_LATENCY_RUNS,
-    device: str = DEVICE,
+    device: str = "cpu",
 ) -> float:
     """
     Mean inference latency in milliseconds over n_runs repetitions.
@@ -106,7 +111,7 @@ def benchmark_model(entry, eval_loader) -> dict:
     print(f" Benchmarking: {name}")
     print(f"{'═'*60}")
 
-    # Calibration — CIFAR-10, CPU
+    # PTQ pipeline — CPU only
     cal_loader = real_calibration_loader(
         data_dir=DATA_DIR,
         batch_size=32,
@@ -125,12 +130,14 @@ def benchmark_model(entry, eval_loader) -> dict:
     int8_model = pipeline_result["int8_model"]
     onnx_path  = pipeline_result["onnx_path"]
 
-    # Latency on DEVICE
-    print(f"\n  Measuring FP32 latency ({N_LATENCY_RUNS} runs on {DEVICE})...")
-    fp32_latency = measure_latency(fp32_model, entry.input_shape, device=DEVICE)
+    # FP32 latency — CUDA if available
+    fp32_device = "cuda" if CUDA_AVAILABLE else "cpu"
+    print(f"\n  Measuring FP32 latency ({N_LATENCY_RUNS} runs on {fp32_device})...")
+    fp32_latency = measure_latency(fp32_model, entry.input_shape, device=fp32_device)
 
-    print(f"  Measuring INT8 latency ({N_LATENCY_RUNS} runs on {DEVICE})...")
-    int8_latency = measure_latency(int8_model, entry.input_shape, device=DEVICE)
+    # INT8 latency — CPU only
+    print(f"  Measuring INT8 latency ({N_LATENCY_RUNS} runs on cpu)...")
+    int8_latency = measure_latency(int8_model, entry.input_shape, device="cpu")
 
     latency_ratio = fp32_latency / int8_latency if int8_latency > 0 else float("nan")
 
@@ -138,20 +145,20 @@ def benchmark_model(entry, eval_loader) -> dict:
     int8_size_mb = measure_onnx_size_mb(onnx_path)
     size_ratio   = fp32_size_mb / int8_size_mb if int8_size_mb > 0 else float("nan")
 
-    # Accuracy on DEVICE with ImageNet
-    print(f"  Evaluating FP32 accuracy (ImageNet val, {DEVICE})...")
+    # Accuracy — CPU only (INT8 model cannot move to CUDA)
+    print("  Evaluating FP32 accuracy (ImageNet val, cpu)...")
     fp32_top1 = evaluate_top1(
-        fp32_model, eval_loader, device=DEVICE, max_batches=N_EVAL_BATCHES
+        fp32_model, eval_loader, device="cpu", max_batches=N_EVAL_BATCHES
     )
 
-    print(f"  Evaluating INT8 accuracy (ImageNet val, {DEVICE})...")
+    print("  Evaluating INT8 accuracy (ImageNet val, cpu)...")
     int8_top1 = evaluate_top1(
-        int8_model, eval_loader, device=DEVICE, max_batches=N_EVAL_BATCHES
+        int8_model, eval_loader, device="cpu", max_batches=N_EVAL_BATCHES
     )
 
     accuracy_delta = fp32_top1 - int8_top1
 
-    # Error attribution on CPU
+    # Error attribution — CPU only
     error_df = run_error_attribution(
         fp32_model, int8_model, entry, device="cpu"
     )
@@ -222,7 +229,9 @@ def _print_final_tradeoff(df: pd.DataFrame) -> None:
 
 def main():
     print("\n══ EdgeZoo Benchmark ══")
-    print(f"  Device: {DEVICE}")
+    print(f"  CUDA available: {CUDA_AVAILABLE}")
+    print(f"  FP32 latency device: {'cuda' if CUDA_AVAILABLE else 'cpu'}")
+    print(f"  INT8 latency device: cpu (quantization is CPU-only)")
     print_zoo_summary()
 
     Path(OUTPUT_DIR).mkdir(parents=True, exist_ok=True)
