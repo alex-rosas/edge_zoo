@@ -10,8 +10,7 @@ only this file.
 """
 
 from dataclasses import dataclass, field
-from typing import Callable, Dict
-import torch
+from typing import Dict
 import torch.nn as nn
 import torchvision.models as tvm
 
@@ -59,11 +58,13 @@ class ModelEntry:
     arch_family: str       # "residual" | "depthwise-separable" | "compound-scaled"
     input_shape: tuple = field(default=(3, 224, 224))
 
-    def size_fp32_MB(self) -> float:
+    @property
+    def size_fp32_mb(self) -> float:
         """FP32 model size in MB (4 bytes per parameter)."""
         return self.n_params_M * 4.0
 
-    def size_int8_MB(self) -> float:
+    @property
+    def size_int8_mb(self) -> float:
         """Theoretical INT8 size in MB (1 byte per parameter)."""
         return self.n_params_M * 1.0
 
@@ -71,8 +72,8 @@ class ModelEntry:
         return (
             f"{self.name:<20} | top-1: {self.top1_accuracy:.1f}%"
             f" | params: {self.n_params_M:.1f}M"
-            f" | FP32: {self.size_fp32_MB():.1f}MB"
-            f" | INT8 (theoretical): {self.size_int8_MB():.1f}MB"
+            f" | FP32: {self.size_fp32_mb:.1f}MB"
+            f" | INT8 (theoretical): {self.size_int8_mb:.1f}MB"
             f" | FLOPs: {self.flops_G:.1f}G"
             f" | family: {self.arch_family}"
         )
@@ -175,12 +176,21 @@ def print_zoo_summary() -> None:
         print(
             f"{entry.name:<20} | {entry.top1_accuracy:>5.1f}% "
             f"| {entry.n_params_M:>6.1f}M "
-            f"| {entry.size_fp32_MB():>7.1f}MB "
-            f"| {entry.size_int8_MB():>7.1f}MB "
+            f"| {entry.size_fp32_mb:>7.1f}MB "
+            f"| {entry.size_int8_mb:>7.1f}MB "
             f"| {entry.flops_G:>6.1f}G "
             f"| {entry.arch_family}"
         )
     print()
+
+
+# ---------------------------------------------------------------------------
+# Registry access
+# ---------------------------------------------------------------------------
+
+def get_zoo() -> Dict[str, ModelEntry]:
+    """Return the full model registry as a dict keyed by model name."""
+    return _REGISTRY
 
 
 # ---------------------------------------------------------------------------
@@ -194,7 +204,7 @@ if __name__ == "__main__":
     print("── 4 MB deployment constraint check ──")
     for name in list_models():
         entry = get_model(name)
-        fits = entry.size_int8_MB() <= 4.0
-        print(f"  {entry.name:<20} INT8: {entry.size_int8_MB():.1f} MB "
+        fits = entry.size_int8_mb <= 4.0
+        print(f"  {entry.name:<20} INT8: {entry.size_int8_mb:.1f} MB "
               f"→ {'✓ fits' if fits else '✗ exceeds'} 4 MB budget")
     print()
