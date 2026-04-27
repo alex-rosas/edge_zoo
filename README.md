@@ -226,6 +226,6 @@ edge_zoo/
 
 ## Case Study
 
-[docs/case_study.md](docs/case_study.md) — Engineering decisions, failure forensics, and what the project found.
+[case_study.md](case_study.md) — Engineering decisions, failure forensics, and what the project found.
 
 Covers: the S_C clipping bug and two wrong hypotheses, the dynamo ONNX crash, the MinMaxObserver collapse forensic, the sorted-dataset problem, observer sensitivity by architecture, and what each of these implies for the next system.
