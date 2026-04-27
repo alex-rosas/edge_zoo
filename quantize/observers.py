@@ -75,8 +75,12 @@ class _HFImageNetDataset(Dataset):
         from datasets import load_dataset
         print("  Downloading ImageNet val split (~750 MB, cached after first run)...")
         ds = load_dataset("evanarlian/imagenet_1k_resized_256", split="val")
-        ds = ds.shuffle(seed=seed)
-        self.ds = ds.select(range(min(max_samples, len(ds))))
+        # Select indices spaced evenly across all 50000 samples to guarantee
+        # uniform class coverage regardless of shuffle order.
+        # 50000 / max_samples = step size → one sample per step covers all classes.
+        step = len(ds) // max_samples
+        indices = list(range(0, step * max_samples, step))
+        self.ds = ds.select(indices)
         self.transform = T.Compose([
             T.CenterCrop(224),
             T.ToTensor(),
