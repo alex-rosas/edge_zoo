@@ -71,7 +71,7 @@ class _HFImageNetDataset(Dataset):
     memory guarantees uniform class coverage across the evaluation subset.
     """
 
-    def __init__(self, max_samples: int = 2000, seed: int = 42):
+    def __init__(self, max_samples: int = 2000):
         from datasets import load_dataset
         print("  Downloading ImageNet val split (~750 MB, cached after first run)...")
         ds = load_dataset("evanarlian/imagenet_1k_resized_256", split="val")
