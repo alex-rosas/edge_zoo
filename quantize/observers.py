@@ -47,10 +47,13 @@ def real_calibration_loader(
     dataset = datasets.CIFAR10(
         root=data_dir, train=False, download=True, transform=transform,
     )
+    generator = torch.Generator()
+    generator.manual_seed(42)
     loader = DataLoader(
         dataset, batch_size=batch_size, shuffle=True,
         num_workers=num_workers, pin_memory=False,
-    )
+        generator=generator,
+    )   
     print(
         f"  Real calibration loader: CIFAR-10 ({len(dataset)} images, "
         f"batch_size={batch_size}, image_size={image_size})"
