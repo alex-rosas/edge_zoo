@@ -1,56 +1,36 @@
 # EdgeZoo — Case Study
 
-**Engineering decisions, failure modes, and what the project actually found.**
+**Engineering decisions, failure forensics, and what the project actually found.**
 
 ---
 
 ## What Makes This Hard
 
-Post-training quantization is not a function call. The pipeline has five
-sequential stages, each of which is a precondition for the next. Getting one
-wrong does not produce an error — it produces a silently incorrect model.
-The three specific hard problems in this project were:
+Post-training quantization is not a function call. Five sequential pipeline stages — each a precondition for the next — interact in ways that are invisible without instrumentation. Getting one stage wrong produces a silently incorrect model, not an error. Three specific hard problems defined this project:
 
-**Calibration data quality is invisible until you instrument it.** A badly
-calibrated model produces INT8 outputs that look plausible — the accuracy
-drop is the only signal, and it is easy to attribute to quantization in general
-rather than to calibration specifically. The miscalibration experiment was
-designed to make this invisible variable visible by isolating it as the
-single free variable.
+**Calibration data quality is invisible until you instrument it.** A badly calibrated model produces INT8 outputs that look plausible — the accuracy drop is the only signal. Without a controlled experiment that isolates calibration data as the single free variable, the degradation has no explanation.
 
-**Quantization error does not distribute uniformly across layers.** A global
-accuracy delta tells you that PTQ costs something — it does not tell you
-where. Without layer-wise attribution, the degradation is a number with no
-architectural explanation. The forward hook infrastructure was built
-specifically to produce that explanation.
+**Quantization error does not distribute uniformly across layers.** A global accuracy delta tells you PTQ costs something. It does not tell you where. The forward hook infrastructure for layer-wise attribution was built specifically to make that invisible distribution visible.
 
-**The INT8 arithmetic advantage is real at the hardware level but conditional
-on the implementation.** A compiler flag is not enough. The assumption that
-`-O2 -march=native` would surface the SIMD throughput advantage of INT8 was
-wrong, and the benchmark was designed to make that condition visible — not
-to demonstrate the advantage, but to find where it does and does not
-materialise.
+**Observer choice is architecture-dependent in ways that are not obvious from the literature.** MinMaxObserver is the standard baseline in PTQ tutorials. This project discovered that it causes complete quantization collapse on depthwise-separable architectures — a finding that is not documented in PyTorch's own quantization guides.
 
 ---
 
 ## When to Use This (vs Alternatives)
 
 ✅ **Use this when:**
-- You have a trained model, no access to the training pipeline, and a hard
-  memory budget. PTQ is the correct tool when retraining is not an option.
-- You need to understand *where* quantization costs before committing to a
-  model choice, not just whether it works.
-- You are preparing to hand a model to a hardware compiler team and need to
-  document which operators will and will not be quantized.
+- You have a trained model, no training pipeline access, and a hard memory budget. PTQ under a one-day constraint with no labelled data is the realistic scenario this project proxies.
+- You need to understand *where* quantization costs before committing to a model for hardware deployment.
+- You are handing a model to a hardware compiler team and need to document ONNX operator coverage gaps before integration.
 
 ❌ **Don't use this when:**
 
 | Scenario | Why | What to use instead |
 |---|---|---|
 | Accuracy loss > 1% is unacceptable | PTQ has no recovery mechanism | QAT with full training pipeline |
-| Target is a Transformer or LLM | Per-channel activation quantization and attention patterns require specialised treatment | GPTQ, AWQ, or SmoothQuant |
-| You need real NPU latency numbers | All timing here is CPU-only | On-device profiling with NXP toolchain |
-| Calibration dataset is unavailable | MinMaxObserver on random data produces degraded models | Synthetic calibration with domain statistics, or QAT |
+| Target is a Transformer or LLM | Attention patterns and activation distributions require specialised treatment | GPTQ, AWQ, or SmoothQuant |
+| You need real NPU latency | All timing here is CPU wall-clock | On-device profiling with NXP toolchain |
+| EfficientNet-B0 is the target model | Its Sigmoid+Mul squeeze-and-excitation blocks resist quantization under both observers tested | Model-specific PTQ configuration or QAT |
 
 ---
 
@@ -59,15 +39,12 @@ materialise.
 | Alternative | What it does | Gap vs EdgeZoo |
 |---|---|---|
 | PyTorch quantization tutorial | Demonstrates PTQ on a single model | No failure analysis, no controlled experiment, no architectural comparison |
-| Hugging Face Optimum | Production INT8 export for Transformers | CNN-focused, no layer-wise diagnostic, no C++ arithmetic benchmark |
-| ONNX Runtime quantization | Graph-level quantization via onnxruntime tools | No calibration quality experiment, no operator coverage analysis |
-| TensorFlow Lite converter | End-to-end mobile deployment pipeline | TF ecosystem only, no PyTorch FX graph mode, no diagnostic instrumentation |
-| gemmlowp / XNNPACK | Hand-optimised integer kernel libraries | Library, not a diagnostic pipeline — does not explain where PTQ fails |
+| Hugging Face Optimum | Production INT8 export for Transformers | CNN-focused, no layer-wise diagnostic, no observer comparison |
+| ONNX Runtime quantization tools | Graph-level quantization via onnxruntime | No calibration quality experiment, no operator coverage analysis |
+| TensorFlow Lite converter | End-to-end mobile deployment pipeline | TF ecosystem only, no PyTorch FX graph mode |
+| gemmlowp / XNNPACK | Hand-optimised integer kernel libraries | Library, not a diagnostic pipeline |
 
-EdgeZoo is not a deployment tool. It is a diagnostic pipeline. The distinction
-matters: a deployment tool optimises for a metric; a diagnostic pipeline
-optimises for understanding the tradeoffs that determine which metric is
-achievable. The project produces findings, not a production artifact.
+EdgeZoo is not a deployment tool. It is a diagnostic pipeline. A deployment tool optimises for a metric; a diagnostic pipeline produces findings that explain which metric is achievable and why.
 
 ---
 
@@ -75,29 +52,19 @@ achievable. The project produces findings, not a production artifact.
 
 ### The data contract
 
-Every downstream function receives a `ModelEntry` from the registry rather
-than loading a model directly. This means the pipeline, the benchmarks, and
-the error attribution all operate on a common interface regardless of
-architecture. The registry stores `arch_family` as an explicit field because
-the architectural label is the explanatory variable for H1 — without it, the
-attribution results are numbers without a frame.
+Every downstream function receives a `ModelEntry` from the registry rather than loading a model directly. This means the pipeline, the benchmarks, and the error attribution all operate on a common interface regardless of architecture. The registry stores `arch_family` as an explicit field because the architectural label is the explanatory variable for H1 — without it, the attribution results are numbers without a frame.
 
 ### The PTQ pipeline as a sequencing constraint
 
-The five stages are not a design choice — they are a constraint. BN-folding
-must precede observer insertion to prevent double-scaling of normalisation
-parameters. Calibration must precede INT8 conversion because conversion reads
-the observer ranges. ONNX export must follow conversion because the INT8
-operators only exist in the converted graph. Writing the pipeline as
-composable functions makes the sequencing explicit and auditable.
+The five stages are not a design choice — they are a constraint imposed by PyTorch's FX graph mode. BN-folding must precede observer insertion to prevent double-scaling. Calibration must precede INT8 conversion because `convert_fx()` reads observer ranges. ONNX export must follow conversion because INT8 operators only exist in the converted graph. Stage 2 deep-copies the model before any graph mutation, preserving the original FP32 weights for layer-wise attribution — without this, the reference signal is destroyed.
+
+### The evaluation design
+
+The evaluation uses strided sampling from `evanarlian/imagenet_1k_resized_256`: every 25th image from the 50,000-image validation set, giving exactly 2 images per class across all 1000 classes. This was verified empirically — the dataset has exactly 50 images per class in strict sequential order. Strided sampling gives uniform class coverage with zero randomness, making the FP32/INT8 accuracy delta fully deterministic and reproducible across sessions. All models evaluate on the same preloaded batch list; streaming loaders would produce different samples per evaluation call.
 
 ### The observer capture window
 
-Observer ranges — the `[α, β]` per-layer min/max values — exist only between
-Stage 3 (calibration) and Stage 4 (conversion). After `convert_fx()`, observer
-nodes are replaced with static scale and zero-point constants. The miscalibration
-experiment captures ranges in this window specifically. Missing it means the
-comparison is impossible to reconstruct without re-running the full pipeline.
+Observer ranges — the `[α, β]` per-layer min/max values — exist only between Stage 3 (calibration) and Stage 4 (conversion). After `convert_fx()`, observer nodes are replaced with static scale and zero-point constants. The miscalibration experiment must capture ranges in this window or the comparison is impossible to reconstruct.
 
 ---
 
@@ -107,70 +74,37 @@ comparison is impossible to reconstruct without re-running the full pipeline.
 
 **Chosen:** Post-training quantization with no retraining.
 **Rejected:** Quantization-aware training.
-**Why:** No access to the training pipeline or labelled training data; one-day
-constraint. QAT achieves higher final accuracy by exposing the model to
-quantization noise during training, but it requires training epochs, a full
-dataset, and a loss function. PTQ operates on a frozen model. Under the stated
-constraints, PTQ is not a simplification — it is the only viable option.
-Framing it as a simplification would be incorrect and would prevent a
-productive discussion about when QAT is worth its cost.
+**Why:** No access to the training pipeline or labelled training data; one-day constraint. QAT achieves higher final accuracy by exposing the model to quantization noise during training, but it requires training epochs and a full dataset. PTQ operates on a frozen model. Under the stated constraints, PTQ is the only viable option — framing it as a simplification would prevent the conversation about when QAT is worth its cost.
 
-### MinMaxObserver as the baseline observer
+### fbgemm default over MinMaxObserver
 
-**Chosen:** `MinMaxObserver` — records the minimum and maximum activation value seen during calibration.
-**Rejected:** `HistogramObserver` (percentile-based), KL-divergence observer.
-**Why:** MinMaxObserver is deterministic, has no hyperparameters, and its
-sensitivity to outliers is a feature of the miscalibration experiment rather
-than a defect. An observer with built-in outlier suppression would partially
-compensate for bad calibration data and reduce the signal the experiment is
-designed to isolate. Percentile and KL observers are a natural next step and
-are explicitly deferred.
+**Chosen:** `get_default_qconfig_mapping("fbgemm")` — HistogramObserver for activations, percentile-based outlier clipping.
+**Rejected:** Custom `MinMaxObserver` QConfig — deterministic, no hyperparameters, tracks absolute min/max.
+**Why:** MinMaxObserver was the original choice and caused quantization collapse on MobileNetV2 and EfficientNet-B0 under CIFAR-10 calibration. The INT8 model predicted a single class (739 — parking meter) for all inputs. `HistogramObserver` clips outliers at the 99.99th percentile, producing stable grids. The switch was validated by the observer comparison experiment. MinMaxObserver is retained in `experiments/miscalibration.py` where its sensitivity to outliers is the controlled variable.
 
-### Per-channel weights, per-tensor activations
+### dynamo=False in ONNX export
 
-**Chosen:** Per-channel quantization for weights; per-tensor for activations.
-**Rejected:** Per-tensor for both; per-channel for both.
-**Why:** Weight distributions vary substantially across output channels —
-a single scale per layer would waste INT8 resolution on channels with narrow
-ranges to accommodate channels with wide ones. Per-channel gives each output
-channel its own scale. Activation distributions are more uniform within a
-layer; per-tensor avoids the runtime cost of per-channel scale vectors at
-inference. This is the configuration recommended in Krishnamoorthi (2018)
-and is standard for production PTQ pipelines.
+**Chosen:** Legacy ONNX exporter (`dynamo=False`).
+**Rejected:** Default dynamo-based exporter (PyTorch 2.x default).
+**Why:** The dynamo exporter traces models using `torch.export.export()`, which attempts to flatten all custom C++ objects including `Conv2dPackedParamsBase` — the internal representation of quantized conv layers. This flattening is not implemented for quantized models. The crash was discovered during the first full benchmark run and was not documented in PyTorch's migration guide. `dynamo=False` is a forward-compatibility guard for any pipeline that exports quantized models.
 
-### Dynamic S_C in the C++ benchmark
+### Strided ImageNet evaluation
 
-**Chosen:** Output scale computed from `max(|C_fp32|) / 127` per run.
-**Rejected:** Fixed `S_C = 0.01`.
-**Why:** The output magnitude of a matrix multiply scales with K. At K = 128,
-values reach ±300; at K = 1024, ±2400. A fixed S_C of 0.01 maps the output
-grid to [-1.28, 1.27] — nearly every output element is clipped to ±127 and
-the error measurement is meaningless (it reports the clipping error, not
-the quantization error). Computing S_C from the actual FP32 output makes
-the grid correct at every size independently. This was a bug discovered
-during the benchmark run and is documented below.
-
-### ONNX interrogation over verification
-
-**Chosen:** Programmatic node classification — quantized vs FP32 arithmetic vs structural.
-**Rejected:** Passive verification (checking scale parameter correctness only).
-**Why:** Verification confirms that the quantization was applied correctly to
-the operators it was applied to. Interrogation asks which operators it was
-*not* applied to and why. The second question is the one a hardware compiler
-engineer would ask: which subgraphs would the toolchain reject, and what
-would you do about them? Each FP32 residual node in the ONNX graph is a
-finding, not a formatting detail.
+**Chosen:** Every 25th image from the sorted validation set — 2 images per class, 2016 total.
+**Rejected:** Random sampling with shuffle; streaming with buffer shuffle.
+**Why:** The dataset is sorted by class with exactly 50 images per class. Streaming shuffle is ineffective because the dataset is partitioned into 52 shards each containing sequential per-class data. Buffer-size shuffling only covers ~4 classes at a time. Random sampling with a seed produced different images across Colab sessions due to non-deterministic HF cache behaviour. Strided sampling is deterministic, class-balanced, and verified to cover all 1000 classes regardless of session state.
 
 ### Standard C++ only in the benchmark
 
 **Chosen:** No external libraries — only `<chrono>` and `<cstdint>`.
-**Rejected:** OpenBLAS, BLAS Accelerate, explicit NEON intrinsics.
-**Why:** An optimised library would produce the expected INT8 speedup but
-would also obscure the condition under which the advantage materialises.
-The benchmark is designed to measure what a compiler produces from a readable
-implementation — not what a hand-optimised kernel achieves. That distinction
-*is* the finding. Using NEON SDOT or AVX2 VNNI explicitly would confirm H4
-rather than test it.
+**Rejected:** OpenBLAS, explicit NEON intrinsics, BLAS Accelerate.
+**Why:** The benchmark is designed to measure what a compiler produces from a readable implementation, not what a hand-optimised kernel achieves. Using NEON SDOT explicitly would confirm H4 rather than test it. The absence of explicit SIMD is the finding — it reveals that the INT8 arithmetic advantage requires explicit implementation, not just a compiler flag. This distinction directly motivates why NPUs exist.
+
+### Dynamic S_C in the C++ benchmark
+
+**Chosen:** `S_C = max(|C_fp32|) / 127` computed from the actual reference output per run.
+**Rejected:** Fixed `S_C = 0.01`.
+**Why:** The output magnitude of a matrix multiply scales with K. At K=128, values reach ±300; at K=1024, ±2400. A fixed S_C clips nearly every output element at larger sizes, and the error measurement reports clipping error rather than quantization error. This was a bug discovered during the first benchmark run and is documented below.
 
 ---
 
@@ -179,209 +113,190 @@ rather than test it.
 **Phase:** 3 — C++ benchmark, first run on Apple Silicon.
 
 **Symptom:**
-
 ```
 Size    FP32 (ms)  INT8 (ms)  Speedup  Max Abs Error
 128×128  0.155      0.717      0.217    93.466
 512×512  12.653     107.712    0.117    215.563
-[benchmark hanging — never reaches 1024×1024]
+[benchmark hanging at 1024×1024]
 ```
 
-Two problems: the error of 93.466 is not in a plausible range for quantization
-error, and the benchmark hung after the second row.
+**Wrong hypothesis 1 — formatting issue.** The error of 93 looked like a unit mismatch or a scale factor applied twice. Inspected `max_abs_error()` — the dequantization was `C_i8[i] * S_C`, which is correct. Ruled out.
 
-**Wrong hypothesis 1 — formatting issue.** The error looked like a unit
-mismatch or a scale factor applied twice. Inspected `max_abs_error()` — the
-function was correct. The dequantization was `C_i8[i] * S_C`, which is right.
-Ruled out.
+**Wrong hypothesis 2 — INT8 output was all zeros.** If the quantized matmul produced zeros, the error would equal `max(|C_fp32|)`. Printed a slice of `C_i8`. The outputs were ±127 almost everywhere — saturation, not silence.
 
-**Wrong hypothesis 2 — the INT8 output was all zeros.** If the quantized
-matmul was producing zeros, the error would equal `max(|C_fp32|)` — plausible
-given the magnitude. Printed a slice of `C_i8`. The outputs were ±127 almost
-everywhere, not zero. The opposite problem: saturation, not silence.
+**Root cause.** `S_C = 0.01` mapped the output grid to `[-1.28, 1.27]`. The actual output of a 128×128 matmul with inputs in `[-2.54, 2.54]` reaches approximately ±300. The requantization step multiplied every INT32 accumulator by `S_A * S_B / S_C = 0.04`, producing scaled values in the thousands — all clipped to ±127. The error of 93 was measuring clipping, not quantization. The hang was a separate issue: 1000 repetitions at 1024×1024 takes ~96 seconds on Apple Silicon.
 
-**Root cause.** `S_C` was fixed at `0.01`. The output grid therefore covered
-`[-1.28, 1.27]`. The actual output of a 128×128 matmul with inputs in
-`[-2.54, 2.54]` reaches approximately `±300`. The requantization step
-multiplied every INT32 accumulator by `S_A * S_B / S_C = 0.04`, producing
-scaled values in the thousands — all clipped to `±127`. The error of 93
-was not a quantization error; it was a measurement of how badly the output
-was clipped. The fix: compute `S_C = max(|C_fp32|) / 127` from the actual
-reference output before each run.
+**Fix.** Compute `S_C = max(|C_fp32|) / 127` from the reference output before each run. Scale reps: 1000/100/10 by matrix size.
 
-**The hang.** Separately, the benchmark used 1000 repetitions at all three
-sizes. At 1024×1024 with a naive triple-loop, one forward pass takes ~96 ms
-on Apple Silicon. 1000 repetitions would take ~96 seconds at that size alone.
-The benchmark was not hung — it was simply running. Fixed by scaling reps:
-1000 / 100 / 10.
+**What would have found it faster.** Printing one element of `C_i8` before the full benchmark would have shown saturation immediately.
 
-**What would have found it faster.** Printing one element of `C_i8` before
-running the full benchmark would have shown saturation immediately. A sanity
-check — `assert max(|C_i8|) < 127` — would have caught it at the first run.
-For any benchmark that measures error, the error should be inspected on a
-small case before scaling up.
+---
 
-**Architectural implication.** Any scale factor that depends on the magnitude
-of a matmul output must be computed dynamically per problem size. A fixed scale
-is a latent bug that becomes visible only when the problem size changes. In
-production, this is why deployment recipes store scale factors per-layer as
-calibrated constants, not as compile-time parameters.
+## The dynamo ONNX Export Crash — A Forensic Account
+
+**Phase:** 2 — first full `benchmark/bench.py` run in Colab.
+
+**Symptom:**
+```
+AttributeError: __torch__.torch.classes.quantized.Conv2dPackedParamsBase
+does not have a field with name '__obj_flatten__'
+torch.onnx._internal.exporter._errors.TorchExportError
+```
+
+**Root cause.** PyTorch 2.x changed the default ONNX exporter to a dynamo-based backend that uses `torch.export.export()`. This attempts to flatten all custom C++ objects, including `Conv2dPackedParamsBase` — the internal representation of quantized conv layers. Flattening is not implemented for this type.
+
+**Fix.** `dynamo=False` in `torch.onnx.export()`. One line, in the right place.
+
+**What to remember.** Any PyTorch version update may change the default ONNX exporter. `dynamo=False` is a required forward-compatibility guard for quantized model export.
+
+---
+
+## The MinMaxObserver Collapse — A Forensic Account
+
+**Phase:** 2 — accuracy evaluation, first run with ImageNet labels.
+
+**Symptom:** MobileNetV2 INT8 accuracy: 0.00%. Every input predicted class 739 (parking meter). INT8 output logit for class 739: 20.46 (vs FP32: 2.36).
+
+**Diagnosis path.** The output logits had reasonable range and std — not a classic collapse. Class 739 just had a systematically inflated logit. Isolated the issue to `features.18.2` (last feature layer before classifier): FP32 features std 0.97, INT8 features std 1.76, L2 error 1021. The quantization was amplifying activations, not approximating them. The final Linear layer received a corrupted signal.
+
+**Root cause.** MinMaxObserver tracks the absolute min and max activation value seen during calibration. CIFAR-10 images, resized to 224×224, drive activations to ranges that diverge substantially from ImageNet activations in early layers. One or more extreme outlier values stretched the INT8 grid across a range that never appears at inference. The 256 steps are distributed across mostly-empty space, with most real activations mapping to the same INT8 bucket.
+
+**Fix.** Replace `MinMaxObserver` with `get_default_qconfig_mapping("fbgemm")`, which uses `HistogramObserver` — percentile-based, clips at 99.99th percentile. One-line change in `pipeline.py`.
+
+**Architectural implication.** Observer choice is architecture-dependent. ResNet-18 (standard Conv, residual) was robust to both observers. MobileNetV2 (depthwise-separable) collapsed completely. EfficientNet-B0 (Sigmoid+Mul squeeze-and-excitation) was badly degraded under both. The observer comparison experiment quantifies this precisely.
+
+---
+
+## The Sorted Dataset Problem — A Forensic Account
+
+**Phase:** 2 — accuracy evaluation, after switching to ImageNet.
+
+**Symptom:** All labels in first 3 batches (96 images) were class 0 or 1. MobileNetV2 FP32 accuracy: 67.56%. MobileNetV2 INT8 accuracy: 0.00% — delta 67.56%.
+
+**Wrong hypothesis 1 — shuffle not applied.** Added `shuffle=True` to the streaming loader. Still 2 unique classes in 96 images. The HF streaming shuffle uses a buffer that only covers ~4 classes at a time because each shard contains sequential per-class data.
+
+**Wrong hypothesis 2 — seed non-determinism.** Verified that `ds.shuffle(seed=42)` in non-streaming mode works — produces 10 unique classes in first 10 samples. But downloading the full dataset consumed 50 GB (all three splits: train + val + test), filling Colab disk.
+
+**Root cause.** The dataset has exactly 50 images per class in strict sequential order across all 52 shards. Any sampling strategy that takes the first N images gets the first N/50 classes only. Streaming shuffle is structurally ineffective for this dataset layout.
+
+**Fix.** Strided sampling: `indices = list(range(0, step * max_samples, step))` where `step = 50000 // 2016 = 24`. This gives 2 images per class, deterministically, regardless of shuffle or session state. Verified: 46 unique classes in first 3 batches (96 images), consistent across runs.
 
 ---
 
 ## Known Limitations
 
-### Accuracy evaluation on CIFAR-10, not ImageNet
+### EfficientNet-B0 severely degraded under PTQ
 
-**What fails:** The absolute top-1 accuracy numbers reported by the pipeline
-are lower than published ImageNet benchmarks because the models were evaluated
-on CIFAR-10 resized to 224×224, not ImageNet. The models were not trained on
-CIFAR-10 and their feature detectors are not calibrated for it.
+**What fails:** 38% accuracy drop under fbgemm default observer; 22% under MinMaxObserver. Neither is acceptable for deployment.
 
-**Root cause:** ImageNet requires a manual download and a licence agreement.
-CIFAR-10 downloads automatically. The choice was made to prioritise
-reproducibility over domain-exact evaluation.
+**Root cause:** EfficientNet-B0's squeeze-and-excitation blocks use Sigmoid and Mul operators that have no INT8 equivalent in ONNX opset 17. These layers remain in FP32 in the exported graph (65 Sigmoid × 65 Mul residual nodes). The FP32/INT8 boundary at these operators introduces requantization error that compounds through the compound-scaled architecture.
 
-**Concrete fix:** Replace `observers.py`'s `real_calibration_loader()` with
-an ImageNet validation subset loader. The accuracy delta (FP32 vs INT8 on
-the same set) remains valid regardless of which dataset is used — only the
-absolute numbers change.
+**Concrete fix:** Model-specific observer configuration using `get_default_qconfig_mapping("fbgemm")` with per-layer overrides for SE blocks. Alternatively, QAT with SE blocks frozen in FP32.
 
-### MinMaxObserver sensitivity to outliers
+### Calibration uses CIFAR-10, not ImageNet
 
-**What fails:** A single extreme activation value encountered during
-calibration stretches the INT8 grid to accommodate it, wasting resolution
-for the bulk of the distribution. This is particularly acute for small
-calibration sets.
+**What fails:** Absolute accuracy numbers on CIFAR-10 were 0.00% for all models in early runs (ImageNet models evaluated against CIFAR-10 labels). Fixed by switching to ImageNet evaluation; calibration still uses CIFAR-10.
 
-**Root cause:** MinMaxObserver records `min` and `max` with no outlier
-suppression. The correct fix is a percentile observer (e.g. 99.9th percentile)
-or a KL-divergence observer that minimises the information loss of the
-quantization.
+**Root cause:** The observer comparison experiment is designed to isolate calibration data quality as the single free variable. Using the same dataset for calibration and evaluation would confound the experiment. CIFAR-10 is used for calibration because it auto-downloads; ImageNet is used for evaluation because it has correct labels.
 
-**Concrete fix:** Replace `MinMaxObserver` with
-`torch.ao.quantization.observer.HistogramObserver` in `pipeline.py`'s
-`qconfig` definition. The miscalibration experiment infrastructure already
-supports this — it is a one-line change.
+**Concrete fix:** Use an ImageNet subset for calibration as well. The infrastructure supports this — swap the `calibration_loader` argument in `run_pipeline()`.
 
-### No real NPU latency
+### INT8 speedup requires explicit SIMD
 
-**What fails:** All latency measurements are CPU wall-clock time. The C++
-benchmark demonstrates the arithmetic efficiency argument but cannot report
-actual inference latency on an NPU.
+**What fails:** C++ benchmark shows INT8 5–8× slower than FP32 on Apple Silicon. On x86, INT8 wins only at 128×128 (speedup 1.19) and loses at larger sizes.
 
-**Root cause:** Hardware not available. NXP Ara-2 is not publicly accessible.
+**Root cause:** The FP32 inner loop auto-vectorises to NEON FMLA / AVX2 FMA. The INT8 inner loop has `static_cast<int32_t>` before each multiply and a 32-bit accumulator, breaking the auto-vectoriser's pattern recognition.
 
-**Concrete fix:** Export the quantized ONNX model and run it through the
-eIQ Toolkit with NXP's profiling tools. The ONNX graph interrogation
-infrastructure already identifies which subgraphs the compiler would accept.
+**Concrete fix:** Replace the inner loop with explicit NEON SDOT intrinsics on ARM or AVX2 VNNI on x86. Jacob et al. (2018) used gemmlowp — a hand-optimised integer kernel — not auto-vectorised C++. The absence of explicit SIMD is the finding; adding it would confirm H4 and separate the arithmetic question from the compiler question.
 
-### INT8 speedup requires explicit SIMD, not just `-march=native`
+### H3 (miscalibration experiment) not run
 
-**What fails:** The C++ benchmark shows INT8 slower than FP32 on Apple Silicon
-at all sizes, and slower at large sizes on x86. The theoretical 4× throughput
-advantage of INT8 SIMD does not materialise from compiler-generated code.
+**What fails:** The controlled experiment comparing real vs Gaussian calibration (`experiments/miscalibration.py`) was designed but not run end-to-end. The observer comparison experiment partially subsumes it.
 
-**Root cause:** The FP32 inner loop (`float += float * float`) is a pattern
-the compiler recognises and maps to FMLA instructions. The INT8 inner loop
-has `static_cast<int32_t>` before each multiply and a 32-bit accumulator —
-enough structural complexity that the auto-vectoriser does not produce an
-equivalent SIMD reduction.
-
-**Concrete fix:** Replace the inner loop with explicit NEON SDOT intrinsics
-on ARM or AVX2 VNNI on x86. This would confirm the theoretical speedup and
-separate the arithmetic question from the compiler question.
+**Concrete fix:** Run `experiments/miscalibration.py` with the fixed-seed calibration loader and ImageNet evaluation.
 
 ---
 
 ## What I Learned
 
-**A fixed quantization parameter is a latent bug that only surfaces at a
-different scale.** `S_C = 0.01` was correct for a toy example; it was wrong
-for every real matrix size in the benchmark. Any scale factor that is set
-at design time rather than computed from data will fail when the data changes.
-The lesson for system design: calibrated constants must be derived from
-representative data, not chosen once and hardcoded.
+**MinMaxObserver is not a safe default for production PTQ.** It is deterministic and requires no hyperparameters, which makes it an attractive baseline. But for architectures with wide or skewed activation distributions — particularly depthwise-separable and SE-gated networks — a single outlier in 100 calibration batches can destroy the quantization grid. `HistogramObserver` should be the default; MinMaxObserver is a controlled-experiment tool.
 
-**The condition under which an empirical result holds is as important as the
-result itself.** H4 was stated on the basis of Jacob et al. (2018), which
-reports 2–3× INT8 speedups on ARM. The result is correct — under the condition
-that you use a hand-optimised integer kernel library. That condition was not
-stated in H4, and the experiment made it visible. Before citing a paper's
-empirical result in a hypothesis, identify what implementation conditions
-the result assumes.
+**A fixed quantization parameter is a latent bug that surfaces only at a different scale.** `S_C = 0.01` was plausible for a toy example and silently wrong for every real matrix size. Any scale factor set at design time rather than computed from data will fail when the data distribution changes. The lesson generalises: calibrated constants must be derived from representative data.
 
-**A refuted hypothesis is a better interview answer than a confirmed one.**
-H4 being wrong produced a finding: the INT8 arithmetic advantage requires
-explicit SIMD or a dedicated integer pipeline, not just a compiler flag. That
-finding directly motivates why NPUs exist. A confirmed H4 would have been a
-number. A refuted H4 is an argument.
+**The condition under which an empirical result holds is as important as the result itself.** H4 was stated on the basis of Jacob et al. (2018), which reports 2–3× INT8 speedups on ARM. The result is correct — under the condition that you use a hand-optimised integer kernel library (gemmlowp), not auto-vectorised C++. That condition was absent from the hypothesis. Stating it explicitly would have sharpened the experiment design.
 
-**Isolating one variable requires holding all others constant, and that
-requires infrastructure.** The miscalibration experiment is only valid because
-both calibration conditions use the same architecture, observer type, bit-width,
-and evaluation data. Building that infrastructure — the shared fixed-seed
-evaluation loader, the observer range capture window — takes as much time as
-the experiment itself. The experiment design is part of the engineering work.
+**Dataset structure is a source of measurement error that is easy to miss.** The HF ImageNet dataset is sorted by class, 50 images per class, across 52 shards. Streaming shuffle with a buffer of 5000 covers only ~4 classes. This structural fact was not documented in the dataset card and required empirical discovery. Before trusting any evaluation dataset, verify the label distribution.
 
-**Squiggles in VS Code are not errors.** `std::clamp` is valid C++17.
-IntelliSense not recognising it is a configuration problem, not a code
-problem. Build and run first; fix the editor configuration separately.
-Stopping to debug the IDE before compiling inverts the priority.
+**PyTorch ONNX export breaks silently on version changes.** The default exporter changed from legacy to dynamo between minor PyTorch versions. The error was a crash, not a warning. `dynamo=False` is a required forward-compatibility guard that should be in every quantized model export call until the dynamo exporter explicitly supports quantized models.
+
+**Observer sensitivity is architecture-dependent and must be measured, not assumed.** EfficientNet-B0 behaved worse under HistogramObserver than MinMaxObserver in the main benchmark run — an inversion of the expected result. The observer comparison experiment exists precisely to surface this kind of unexpected interaction. Assuming one observer is universally better is a design error.
 
 ---
 
 ## Results
 
-| Dimension | FP32 baseline | INT8 PTQ |
+| Dimension | ResNet-18 | MobileNetV2 | EfficientNet-B0 |
+|---|---|---|---|
+| FP32 size (MB) | 46.80 | 13.60 | 21.20 |
+| INT8 size (MB) | 11.26 | 3.67 | 5.63 |
+| Size ratio | 4.16× | 3.70× | 3.76× |
+| FP32 latency — CUDA (ms) | 3.40 | 5.59 | 9.16 |
+| INT8 latency — CPU (ms) | 36.76 | 21.74 | 46.89 |
+| FP32 top-1 (ImageNet, strided) | 67.81% | 67.31% | 74.45% |
+| INT8 top-1 (fbgemm) | 67.56% | 60.12% | 36.46% |
+| Accuracy delta (fbgemm) | −0.25% | −7.19% | −38.00% |
+| INT8 top-1 (minmax) | 64.93% | 0.10% | 52.63% |
+| Accuracy delta (minmax) | −2.88% | −67.21% | −21.83% |
+| Fits 4 MB budget | ✗ | ✓ | ✗ |
+| ONNX coverage | 62.7% | 67.7% | 64.8% |
+
+### Observer comparison finding
+
+| Model | Δ fbgemm | Δ minmax | Observer sensitivity |
+|---|---|---|---|
+| ResNet-18 | 0.25% | 2.88% | Low — robust to both |
+| MobileNetV2 | 7.19% | 67.21% | Critical — collapse under minmax |
+| EfficientNet-B0 | 38.00% | 21.83% | High — degraded under both; worse under fbgemm |
+
+### C++ scaling benchmark (H4 refuted)
+
+| Size | Apple Silicon speedup | x86 speedup |
 |---|---|---|
-| ResNet-18 size | 46.8 MB | 11.7 MB (4.0× reduction) |
-| MobileNetV2 size | 13.6 MB | 3.4 MB (4.0× reduction) |
-| EfficientNet-B0 size | 21.2 MB | 5.3 MB (4.0× reduction) |
-| Fits 4 MB budget | None | MobileNetV2 only |
-| INT8 latency vs FP32 (CPU) | — | [fill after Phase 2 run] |
-| Accuracy delta (real calibration) | — | [fill after Phase 2 run] |
-| Calibration delta (real vs Gaussian) | — | [fill after Phase 2 run] |
-| INT8 speedup — Apple Silicon 128×128 | 1.0× | 0.20× (FP32 faster) |
-| INT8 speedup — x86 128×128 | 1.0× | 1.19× (INT8 faster) |
-| INT8 speedup — x86 1024×1024 | 1.0× | 0.43× (FP32 faster) |
+| 128×128 | 0.199 (INT8 slower) | 1.192 (INT8 faster) |
+| 512×512 | 0.131 (INT8 slower) | 0.502 (INT8 slower) |
+| 1024×1024 | 0.131 (INT8 slower) | 0.430 (INT8 slower) |
+
+### Hypothesis outcomes
+
+| Hypothesis | Prediction | Outcome |
+|---|---|---|
+| H1 | MobileNetV2 depthwise layers rank highest in L2 error | Partially consistent — prominent in top-10; EfficientNet shows higher absolute error |
+| H2 | ~4× size reduction, 1.5–2.5× latency improvement | ✓ Confirmed — size 3.7–4.2×; latency comparison complicated by CPU/CUDA split |
+| H3 | Real calibration outperforms Gaussian by ≥ 0.5% | Pending — miscalibration.py not run end-to-end |
+| H4 | INT8 speedup grows with matrix size | Refuted on both platforms |
 
 ---
 
 ## What I'd Do Differently
 
-**Write the calibration sanity check before the full benchmark run.** A
-two-line assertion — print one element of the INT8 output, check that
-`max(|C_i8|) < 127` — would have caught the S_C bug at the first run
-rather than after a hung benchmark and a wrong-hypothesis cycle. For any
-experiment that measures error, add a small-scale sanity check before
-scaling up.
+**Verify the evaluation dataset's label distribution before running any accuracy measurement.** Three runs produced wrong results because the dataset's class ordering was assumed to be random. A five-line check — `Counter(ds["label"])`, `min/max counts`, `first 100 labels` — would have caught this in Phase 1 and saved multiple hours of debugging across Phases 2 and 3.
 
-**State the implementation conditions in each hypothesis.** H4 said "INT8
-speedup grows with matrix size." It should have said "INT8 speedup with
-compiler-generated code grows with matrix size, assuming the compiler
-auto-vectorises the INT8 inner loop." The missing condition is the entire
-finding. Stating it explicitly in the hypothesis would have sharpened the
-experiment design.
+**Run the observer comparison experiment before choosing the default observer.** MinMaxObserver was chosen as the baseline because it is standard in the literature. The collapse it caused on MobileNetV2 was discovered only after running the full pipeline. Running a quick observer comparison on one model in Phase 2 would have identified the issue immediately and informed the design of the miscalibration experiment.
 
-**Run Phase 2 in Colab before writing the Phase 2 report.** The accuracy
-delta and layer error rankings are still null in the recipe because Phase 2
-was designed and documented before being run end-to-end. In a real project,
-results tables are written after the experiment, not before. The structure
-was right; the sequencing was wrong.
+**Write the C++ benchmark with a small-scale sanity check before scaling.** Printing one element of `C_i8` and asserting `max(|C_i8|) < 127` before the full benchmark run would have caught the S_C clipping bug at the first call rather than after a hanging run and two wrong hypotheses.
+
+**Use ImageNet for calibration from the start.** CIFAR-10 was chosen for its auto-download convenience. The correct calibration data — images from the same distribution the model was trained on — was available via HF streaming from Phase 2 onward. Using CIFAR-10 for calibration introduced an uncontrolled variable that required the observer comparison experiment to disambiguate.
 
 ---
 
 ## Status
 
-Phase 3 complete. Phase 4 (deployment recipe and README) complete.
-Phase 2 results (`benchmark/bench.py`) pending full Colab run to populate
-accuracy delta, layer error rankings, and ONNX coverage table.
+All four phases complete. Observer comparison experiment complete. H3 (miscalibration experiment) pending. Calibration loader now has a fixed seed for reproducibility.
 
 **Next three priorities if resumed:**
-1. Run `benchmark/bench.py` in Colab and fill null fields in `recipe.yaml` and this document
-2. Replace `MinMaxObserver` with `HistogramObserver` and re-run the miscalibration experiment to measure the delta
-3. Add explicit NEON SDOT intrinsics to `bench.cpp` and compare against the auto-vectorised baseline
+1. Run `experiments/miscalibration.py` end-to-end with fixed-seed calibration and ImageNet evaluation to populate H3
+2. Add explicit NEON SDOT intrinsics to `bench.cpp` to confirm the theoretical INT8 speedup and separate the arithmetic question from the compiler question
+3. Use ImageNet subset for calibration and measure whether observer collapse on MobileNetV2 persists with domain-matched calibration data
 
 ---
 
@@ -390,14 +305,10 @@ accuracy delta, layer error rankings, and ONNX coverage table.
 - He et al., "Deep residual learning for image recognition," CVPR 2016
 - Sandler et al., "MobileNetV2: Inverted residuals and linear bottlenecks," CVPR 2018
 - Tan & Le, "EfficientNet: Rethinking model scaling for CNNs," ICML 2019
-- Jacob et al., "Quantization and training of neural networks for efficient
-  integer-arithmetic-only inference," CVPR 2018
-- Krishnamoorthi, "Quantizing deep convolutional networks for efficient
-  inference," arXiv 1806.08342, 2018
-- Nagel et al., "A white paper on neural network quantization,"
-  arXiv 2106.08295, 2021
+- Jacob et al., "Quantization and training of neural networks for efficient integer-arithmetic-only inference," CVPR 2018
+- Krishnamoorthi, "Quantizing deep convolutional networks for efficient inference," arXiv 1806.08342, 2018
+- Nagel et al., "A white paper on neural network quantization," arXiv 2106.08295, 2021
 
 ---
 
-*See [README.md](../README.md) for setup instructions, project structure, and
-how to run.*
+*See [README.md](../README.md) for setup instructions, project structure, and how to run.*
