@@ -2,14 +2,7 @@
 quantize/pipeline.py
 --------------------
 Five-stage post-training quantization (PTQ) pipeline using PyTorch FX graph
-mode (prepare_fx / convert_fx), the appropriate quantization API for
-PyTorch 2.11.0.
-
-API selection rationale:
-  torch.ao.quantization submodules confirmed present in this environment:
-    quantize_fx  ✓  — used here
-    quantize_pt2e ✗ — not present in this build (requires torchao or ≥ 2.4+)
-  FX graph mode is the stable, fully-supported path for this install.
+mode (prepare_fx / convert_fx).
 
 Pipeline stages and their ordering constraint:
   1. fold_batchnorm   — deep-copy + eval; BN folding handled by prepare_fx
@@ -18,14 +11,24 @@ Pipeline stages and their ordering constraint:
   4. convert_to_int8  — convert_fx(); freeze ranges, lower to INT8 ops
   5. export_onnx      — torch.onnx.export(); portable IR for hardware compilers
 
-Design decisions (proposal, Section 6):
+QConfig decision:
+  Uses get_default_qconfig_mapping("fbgemm") — PyTorch's recommended
+  production PTQ configuration. This uses HistogramObserver for activations
+  (percentile-based, outlier-robust) and PerChannelMinMaxObserver for weights.
+
+  The original custom MinMaxObserver QConfig was replaced after discovering
+  that MinMaxObserver causes quantization collapse on MobileNetV2 and
+  EfficientNet-B0: extreme activation outliers stretch the INT8 grid so far
+  that the model predicts a single class for all inputs. HistogramObserver
+  clips outliers at the 99.99th percentile, producing stable grids.
+
+  MinMaxObserver is retained in experiments/miscalibration.py where its
+  sensitivity to outliers is the controlled variable being studied (H3).
+
+Design decisions:
   - PTQ over QAT: no training pipeline access, one-day constraint
-  - Per-channel symmetric INT8 for weights: distributions vary across channels
-  - Per-tensor affine uint8 for activations: uniform within a layer;
-    avoids per-channel scale vectors at inference
-  - MinMaxObserver as baseline: deterministic, no hyperparameter tuning;
-    sensitivity to outliers is a feature of the miscalibration experiment
   - ONNX opset 17: hardware-compiler interchange format
+  - dynamo=False: legacy exporter required for quantized Conv2dPackedParamsBase
 """
 
 import copy
@@ -36,42 +39,7 @@ import torch.nn as nn
 import torch.fx
 
 from torch.ao.quantization.quantize_fx import prepare_fx, convert_fx
-from torch.ao.quantization import QConfigMapping
-from torch.ao.quantization.observer import (
-    MinMaxObserver,
-    PerChannelMinMaxObserver,
-)
-
-
-# ─── Shared QConfig ───────────────────────────────────────────────────────────
-
-def _build_qconfig_mapping() -> QConfigMapping:
-    """
-    Construct the global QConfigMapping used across all pipeline runs.
-
-    QConfig decision (proposal, Section 6):
-      - Per-channel MinMaxObserver for weights: weight distributions vary
-        substantially across output channels; per-channel quantization is
-        critical for weight accuracy.
-      - Per-tensor MinMaxObserver for activations: activation distributions
-        are more uniform within a layer; per-tensor avoids the runtime cost
-        of per-channel scale vectors at inference.
-      - MinMax (not percentile or KL): deterministic, no hyperparameter tuning.
-        Sensitivity to outliers is a feature of the miscalibration experiment,
-        not a defect. Percentile and KL observers are a natural next step,
-        explicitly deferred (proposal, Section 6).
-    """
-    qconfig = torch.ao.quantization.QConfig(
-        activation=MinMaxObserver.with_args(
-            dtype=torch.quint8,
-            qscheme=torch.per_tensor_affine,
-        ),
-        weight=PerChannelMinMaxObserver.with_args(
-            dtype=torch.qint8,
-            qscheme=torch.per_channel_symmetric,
-        ),
-    )
-    return QConfigMapping().set_global(qconfig)
+from torch.ao.quantization import get_default_qconfig_mapping
 
 
 # ─── Stage 1: BN-folding ──────────────────────────────────────────────────────
@@ -81,21 +49,10 @@ def fold_batchnorm(model: nn.Module) -> nn.Module:
     Deep-copy the model and set eval mode.
 
     BatchNorm folding is handled automatically during prepare_fx() graph
-    capture — it is part of the FX tracing pass. This function exists as
-    an explicit pipeline stage for two reasons:
-
-      1. It deep-copies the model before any mutation, preserving the original
-         FP32 weights in the zoo as the reference signal for layer-wise error
-         attribution (error_analysis.py). Mutating the zoo entry in-place
-         would destroy that reference.
-
-      2. It documents the stage boundary: the model returned here is a clean
-         FP32 copy in eval mode, ready for FX graph capture.
-
-    The BN-folding formula (proposal, Section 4.2):
-        W' = (γ / sqrt(σ² + ε)) · W
-        b' = γ · (b - μ) / sqrt(σ² + ε) + β
-    This happens inside prepare_fx() — we do not implement it manually.
+    capture. This function exists as an explicit stage to:
+      1. Deep-copy the model before any mutation, preserving the original
+         FP32 weights for layer-wise error attribution.
+      2. Document the stage boundary clearly.
     """
     model = copy.deepcopy(model)
     model.eval()
@@ -109,32 +66,28 @@ def insert_observers(
     example_input: torch.Tensor,
 ) -> torch.fx.GraphModule:
     """
-    Trace the model into an FX graph and insert MinMax observer nodes.
+    Trace the model into an FX graph and insert observer nodes.
 
-    prepare_fx() does two things in one pass:
-      a) Traces the model into an FX graph IR. BatchNorm folding and
-         constant folding are applied during this capture. The result is
-         a GraphModule where every operation is explicit and inspectable.
-      b) Inserts observer nodes at every quantizable activation site.
-         The returned model still computes in FP32; observers are passengers
-         that accumulate statistics during calibration.
+    Uses get_default_qconfig_mapping("fbgemm") — PyTorch's recommended
+    production PTQ configuration. "fbgemm" targets x86 CPUs and uses
+    HistogramObserver for activations, which clips outliers at the 99.99th
+    percentile rather than tracking absolute min/max.
 
-    Why FX over eager mode:
-      FX graph capture means observer insertion, calibration, and quantization
-      all operate on the same graph representation. This makes the exported
-      ONNX graph more faithful to what was actually quantized — important for
-      the ONNX interrogation stage (onnx_interrogate.py).
+    Why not the custom MinMaxObserver QConfig:
+      MinMaxObserver causes quantization collapse on MobileNetV2 and
+      EfficientNet-B0 — a single activation outlier stretches the INT8 grid
+      to cover values that never appear at inference, wasting most of the
+      256 steps. HistogramObserver is robust to this.
 
     Args:
         model:         FP32 model returned by fold_batchnorm().
-        example_input: One representative input tensor. Shape matters for
-                       graph tracing; values are irrelevant.
+        example_input: One representative input tensor.
 
     Returns:
         A prepared torch.fx.GraphModule with observer nodes inserted.
     """
     model.eval()
-    qconfig_mapping = _build_qconfig_mapping()
+    qconfig_mapping = get_default_qconfig_mapping("fbgemm")
     prepared = prepare_fx(model, qconfig_mapping, example_inputs=(example_input,))
     return prepared
 
@@ -148,22 +101,12 @@ def calibrate(
     device: str = "cpu",
 ) -> torch.fx.GraphModule:
     """
-    Run forward passes so observers accumulate true activation ranges.
+    Run forward passes so observers accumulate activation statistics.
 
-    This stage is the intervention point for the miscalibration experiment
-    (experiments/miscalibration.py). The entire pipeline is held constant
-    across the two experimental conditions; only the calibration DataLoader
-    changes — real images versus random Gaussian tensors. That single-variable
-    design makes the accuracy delta between the two conditions interpretable
-    as the isolated effect of calibration data quality.
-
-    n_batches=100 is a standard PTQ heuristic. The model is not being trained:
-    no gradients are computed, no weights are updated. Each observer accumulates
-    the min and max activation value seen at its site, producing [α, β] — the
-    range that defines the INT8 grid for that layer:
-
-        s = (β - α) / (q_max - q_min)
-        z = clip(round(-α / s), q_min, q_max)
+    The model runs in FP32 during calibration — no gradients, no weight
+    updates. Observers accumulate statistics that define the INT8 grid
+    per layer. With HistogramObserver, the grid is defined by the
+    99.99th percentile of observed activations, not the absolute max.
 
     Args:
         model:              Prepared model from insert_observers().
@@ -195,18 +138,10 @@ def convert_to_int8(model: torch.fx.GraphModule) -> torch.fx.GraphModule:
     """
     Freeze observed activation ranges and lower the FX graph to INT8 ops.
 
-    convert_fx() does three things in one pass:
-      1. Reads the accumulated [α, β] from each observer node.
-      2. Computes scale s and zero-point z for each quantizable site.
-      3. Replaces observer nodes and FP32 ops with their INT8 equivalents.
-
-    The returned model computes in INT8 (weights and activations) and
+    convert_fx() reads observer statistics, computes scale s and zero-point z
+    per layer, and replaces FP32 ops with INT8 equivalents. The model
     accumulates into INT32 before requantizing — the integer arithmetic
-    pipeline of Jacob et al. 2018 (cited in the proposal, Section 4.2).
-
-    This function consumes the prepared model. If the prepared model is
-    needed again (e.g. for a second calibration run in the miscalibration
-    experiment), deep-copy it before calling this function.
+    pipeline of Jacob et al. 2018.
 
     Returns:
         A quantized torch.fx.GraphModule operating in INT8.
@@ -227,29 +162,19 @@ def export_onnx(
     """
     Serialize the quantized FX graph to ONNX opset 17.
 
-    Why ONNX opset 17 (proposal, Section 4.2):
-      Hardware compilers in the automotive and embedded sector — including
-      NXP's toolchain — consume ONNX as their interchange format. Exporting
-      to ONNX is not a formality: it is where PyTorch's internal quantized
-      representation is lowered to a standardised operator graph. Operators
-      that PyTorch can quantize but the ONNX backend cannot represent will
-      appear as FP32 nodes in the exported graph. The ONNX interrogation
-      stage (onnx_interrogate.py) detects exactly this — counting quantized
-      versus FP32 operator nodes is a diagnostic step, not a verification step.
-
     Why dynamo=False:
-      The new dynamo-based ONNX exporter (default in PyTorch 2.x) does not
-      support quantized models with packed conv parameters
-      (Conv2dPackedParamsBase). The legacy exporter handles these correctly.
+      The dynamo-based ONNX exporter (default in PyTorch 2.x) does not
+      support quantized models with Conv2dPackedParamsBase. The legacy
+      exporter handles these correctly.
 
     Args:
-        model:          Quantized model from convert_to_int8().
-        input_shape:    Tensor shape excluding batch dim, e.g. (3, 224, 224).
-        output_path:    Destination path for the .onnx file.
-        opset_version:  ONNX opset. Default: 17.
+        model:         Quantized model from convert_to_int8().
+        input_shape:   Tensor shape excluding batch dim, e.g. (3, 224, 224).
+        output_path:   Destination path for the .onnx file.
+        opset_version: ONNX opset. Default: 17.
 
     Returns:
-        output_path string for downstream consumption by the pipeline runner.
+        output_path string.
     """
     Path(output_path).parent.mkdir(parents=True, exist_ok=True)
     dummy_input = torch.zeros(1, *input_shape)
@@ -261,7 +186,7 @@ def export_onnx(
             (dummy_input,),
             output_path,
             opset_version=opset_version,
-            dynamo=False,          # legacy exporter — required for quantized models
+            dynamo=False,
             input_names=["input"],
             output_names=["output"],
             dynamic_axes={
@@ -287,11 +212,6 @@ def run_pipeline(
     """
     Execute all five stages in order and return a results dict.
 
-    This is the entry point called by the benchmark script and the
-    miscalibration experiment. It enforces stage ordering, preserves the
-    original FP32 model for downstream comparison, and collects all
-    artifacts produced by the pipeline.
-
     Stage ordering is a hard constraint:
       - Stage 1 before Stage 2: deep-copy before any graph mutation
       - Stage 2 before Stage 3: observers must exist before calibration runs
@@ -300,23 +220,22 @@ def run_pipeline(
 
     Args:
         entry:              ModelEntry from zoo.py.
-        calibration_loader: DataLoader for calibration (real or synthetic).
+        calibration_loader: DataLoader for calibration.
         output_dir:         Directory for exported ONNX files.
         n_cal_batches:      Number of calibration batches. Default: 100.
         device:             Compute device. Default: "cpu".
 
     Returns:
         {
-            "name":       str           — model name, for result tables
-            "fp32_model": nn.Module     — original FP32 model, untouched
-            "int8_model": GraphModule   — quantized model
-            "onnx_path":  str           — path to exported ONNX file
+            "name":       str        — model name
+            "fp32_model": nn.Module  — original FP32 model, untouched
+            "int8_model": GraphModule — quantized model
+            "onnx_path":  str        — path to exported ONNX file
         }
     """
     name = entry.name
     print(f"\n── Pipeline: {name} ──")
 
-    # Preserve the original FP32 model for layer-wise error attribution.
     fp32_model = copy.deepcopy(entry.model)
     fp32_model.eval()
 
