@@ -8,16 +8,20 @@ Two calibration loaders (for the miscalibration experiment):
   - gaussian_calibration_loader() Random N(0,1) tensors, same shape
 
 Evaluation:
-  - imagenet_eval_loader()        evanarlian/imagenet_1k_resized_256 via HF
-                                  streaming. No licence or token required.
-  - preload_eval_batches()        Materializes the streaming loader into a list
-                                  of (images, labels) tuples so all models in a
+  - imagenet_eval_loader()        evanarlian/imagenet_1k_resized_256, fully
+                                  downloaded and shuffled. Non-streaming mode
+                                  required — streaming shuffle is ineffective
+                                  on this dataset due to per-class shard
+                                  partitioning (50 images × 1000 classes,
+                                  sorted sequentially).
+  - preload_eval_batches()        Materializes the loader into a list of
+                                  (images, labels) tuples so all models in a
                                   benchmark run evaluate on identical data.
 """
 
 import torch
 from torch import nn
-from torch.utils.data import DataLoader, Dataset, IterableDataset
+from torch.utils.data import DataLoader, Dataset
 import torchvision.transforms as T
 import torchvision.datasets as datasets
 
@@ -54,43 +58,40 @@ def real_calibration_loader(
     return loader
 
 
-# ─── ImageNet evaluation loader (HF streaming, no token required) ─────────────
+# ─── ImageNet evaluation dataset ─────────────────────────────────────────────
 
-class _HFImageNetDataset(IterableDataset):
+class _HFImageNetDataset(Dataset):
     """
-    Wraps evanarlian/imagenet_1k_resized_256 validation split as a PyTorch
-    IterableDataset using HF streaming. No licence or token required.
-    Images are pre-resized to 256px; we apply CenterCrop(224) and normalisation.
+    ImageNet val split loaded fully into memory and shuffled.
+
+    Non-streaming mode is required because the dataset is partitioned into
+    52 shards each containing sequential per-class images. Streaming with a
+    shuffle buffer is ineffective — buffer_size=5000 only covers ~4 classes
+    at a time. Downloading the full val split (~750 MB) and shuffling in
+    memory guarantees uniform class coverage across the evaluation subset.
     """
 
-    def __init__(self, max_samples: int = 2000):
-        self.max_samples = max_samples
+    def __init__(self, max_samples: int = 2000, seed: int = 42):
+        from datasets import load_dataset
+        print("  Downloading ImageNet val split (~750 MB, cached after first run)...")
+        ds = load_dataset("evanarlian/imagenet_1k_resized_256", split="val")
+        ds = ds.shuffle(seed=seed)
+        self.ds = ds.select(range(min(max_samples, len(ds))))
         self.transform = T.Compose([
             T.CenterCrop(224),
             T.ToTensor(),
             T.Normalize(mean=IMAGENET_MEAN, std=IMAGENET_STD),
         ])
 
-    def __iter__(self):
-        from datasets import load_dataset
-        ds = load_dataset(
-            "evanarlian/imagenet_1k_resized_256",
-            split="val",
-            streaming=True,
-        ).shuffle(buffer_size=5000, seed=42)
-        # Dataset is sorted by class (50 images per class × 1000 classes = 50000).
-        # Sample every 25th image to get ~2 images per class across all 1000 classes.
-        count = 0
-        for i, sample in enumerate(ds):
-            if count >= self.max_samples:
-                break
-            if i % 25 != 0:
-                continue
-            img = sample["image"]
-            if img.mode != "RGB":
-                img = img.convert("RGB")
-            yield self.transform(img), sample["label"]
-            count += 1
+    def __len__(self) -> int:
+        return len(self.ds)
+
+    def __getitem__(self, idx: int):
+        sample = self.ds[idx]
+        img = sample["image"]
+        if img.mode != "RGB":
+            img = img.convert("RGB")
+        return self.transform(img), sample["label"]
 
 
 def imagenet_eval_loader(
@@ -98,34 +99,40 @@ def imagenet_eval_loader(
     max_samples: int = 2000,
 ) -> DataLoader:
     """
-    ImageNet-1k validation set via HF streaming.
-    No token or licence required.
+    ImageNet-1k validation set, shuffled, no token required.
+
+    Downloads evanarlian/imagenet_1k_resized_256 val split (~750 MB) once
+    and caches it in ~/.cache/huggingface. Subsequent runs use the cache.
+
+    Args:
+        batch_size:  Images per batch. Default: 32.
+        max_samples: Validation images to use. Default: 2000.
+
+    Returns:
+        DataLoader yielding (images, labels) with ImageNet normalisation.
     """
     dataset = _HFImageNetDataset(max_samples=max_samples)
-    loader  = DataLoader(dataset, batch_size=batch_size, num_workers=0)
+    loader  = DataLoader(dataset, batch_size=batch_size, num_workers=2)
     print(
-        f"  ImageNet eval loader: HF streaming evanarlian/imagenet_1k_resized_256 "
-        f"(max {max_samples} images, batch_size={batch_size})"
+        f"  ImageNet eval loader: {len(dataset)} images, "
+        f"batch_size={batch_size}, shuffled (seed=42)"
     )
     return loader
 
 
 def preload_eval_batches(loader: DataLoader, max_batches: int = 63) -> list:
     """
-    Materialise a streaming DataLoader into a list of (images, labels) tuples.
+    Materialise a DataLoader into a list of (images, labels) tuples.
 
     Why this is necessary:
-      HF streaming loaders are single-pass iterators. Once exhausted they
-      restart from the beginning on the next iteration — but restarting
-      re-initialises the stream and may return a different ordering or subset
-      depending on network state. When FP32 and INT8 models evaluate on
-      different batches, the accuracy delta is meaningless.
-
-      Preloading once into memory guarantees all models evaluate on exactly
-      the same images in the same order.
+      When FP32 and INT8 models call evaluate_top1() on the same DataLoader,
+      the second call sees a fresh iteration — potentially different ordering
+      if shuffle=True. Preloading into a list guarantees both models evaluate
+      on exactly the same images in the same order, making the accuracy delta
+      the only valid metric.
 
     Args:
-        loader:      DataLoader wrapping an IterableDataset.
+        loader:      DataLoader to materialise.
         max_batches: Number of batches to collect.
 
     Returns:
@@ -218,8 +225,8 @@ def evaluate_top1(
     Compute top-1 accuracy on a DataLoader or preloaded batch list.
 
     Accepts either a DataLoader or the list returned by preload_eval_batches().
-    Iterating a list is deterministic and repeatable — the correct choice when
-    comparing FP32 and INT8 accuracy on the same data.
+    Pass the preloaded list when comparing FP32 and INT8 to guarantee both
+    models see identical data.
 
     Args:
         model:       Any nn.Module (FP32 or INT8).
